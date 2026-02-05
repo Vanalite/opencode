@@ -470,9 +470,18 @@ export const StdioCommand = cmd({
               const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
                 // Inject x-opencode-directory header so Server.App middleware
                 // resolves the correct project directory instead of process.cwd()
-                const headers = new Headers(init?.headers)
-                headers.set("x-opencode-directory", taskProjectPath)
-                const request = new Request(input, { ...init, headers })
+                // Note: The SDK passes a Request object (not URL + init), so we must
+                // handle both cases to preserve the request body correctly.
+                let request: Request
+                if (input instanceof Request) {
+                  const mergedHeaders = new Headers(input.headers)
+                  mergedHeaders.set("x-opencode-directory", taskProjectPath)
+                  request = new Request(input, { headers: mergedHeaders })
+                } else {
+                  const headers = new Headers(init?.headers)
+                  headers.set("x-opencode-directory", taskProjectPath)
+                  request = new Request(input, { ...init, headers })
+                }
                 return Server.App().fetch(request)
               }) as typeof globalThis.fetch
               const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
