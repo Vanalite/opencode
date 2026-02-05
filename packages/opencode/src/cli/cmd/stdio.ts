@@ -175,10 +175,53 @@ async function runTask(
   const events = await sdk.event.subscribe()
   let completed = false
   let errorMessage: string | undefined
+  let retryCount = 0
+  const MAX_RETRIES = 3
 
   // Event loop
   const eventLoop = async () => {
     for await (const event of events.stream) {
+      // Handle session status changes (retry, idle, busy)
+      if (
+        event.type === "session.status" &&
+        event.properties.sessionID === sessionId
+      ) {
+        const status = event.properties.status
+        if (status.type === "retry") {
+          retryCount++
+          const retryMsg = `Provider connection failed (attempt ${retryCount}): ${(status as { message?: string }).message || "retrying..."}`
+          sendMessage({
+            type: "event",
+            id: msgId,
+            payload: {
+              event: {
+                type: "text.delta",
+                text: retryMsg,
+              },
+            },
+          })
+          // After MAX_RETRIES, abort the session to prevent infinite retry loop
+          if (retryCount >= MAX_RETRIES) {
+            errorMessage = `Provider unreachable after ${MAX_RETRIES} attempts. Is Jan's local API server running?`
+            sendMessage({
+              type: "error",
+              id: msgId,
+              payload: {
+                code: "PROVIDER_UNREACHABLE",
+                message: errorMessage,
+              },
+            })
+            // Abort the session to stop retries
+            try {
+              await sdk.session.abort({ sessionID: sessionId })
+            } catch (_) {
+              // Ignore abort errors
+            }
+            break
+          }
+        }
+      }
+
       if (event.type === "message.part.updated") {
         const part = event.properties.part
         if (part.sessionID !== sessionId) continue
@@ -425,7 +468,11 @@ export const StdioCommand = cmd({
             const taskAgent = payload.agent || defaultAgent
             await bootstrap(taskProjectPath, async () => {
               const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
-                const request = new Request(input, init)
+                // Inject x-opencode-directory header so Server.App middleware
+                // resolves the correct project directory instead of process.cwd()
+                const headers = new Headers(init?.headers)
+                headers.set("x-opencode-directory", taskProjectPath)
+                const request = new Request(input, { ...init, headers })
                 return Server.App().fetch(request)
               }) as typeof globalThis.fetch
               const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
