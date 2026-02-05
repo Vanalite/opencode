@@ -103,6 +103,13 @@ function sendMessage(message: OpenCodeToJan): void {
   process.stdout.write(JSON.stringify(message) + EOL)
 }
 
+// Active session state for permission_response and cancel handling
+let activeSession: {
+  sdk: OpencodeClient
+  sessionId: string
+  taskId: string
+} | null = null
+
 async function runTask(
   sdk: OpencodeClient,
   projectPath: string,
@@ -110,6 +117,7 @@ async function runTask(
   agent?: string,
   taskId?: string
 ): Promise<string | undefined> {
+  const msgId = taskId || "unknown"
   const rules = [
     {
       permission: "question",
@@ -135,7 +143,7 @@ async function runTask(
   if (!sessionId) {
     sendMessage({
       type: "error",
-      id: taskId || "unknown",
+      id: msgId,
       payload: {
         code: "SESSION_CREATION_FAILED",
         message: "Failed to create session",
@@ -144,10 +152,17 @@ async function runTask(
     return undefined
   }
 
+  // Track active session so permission_response and cancel can reach the SDK
+  activeSession = { sdk, sessionId, taskId: msgId }
+
+  // Track files changed and final text for the result message
+  const filesChanged: string[] = []
+  let lastCompleteText: string | undefined
+
   // Send session.started event
   sendMessage({
     type: "event",
-    id: taskId || sessionId,
+    id: msgId,
     payload: {
       event: {
         type: "session.started",
@@ -159,6 +174,7 @@ async function runTask(
   // Subscribe to events
   const events = await sdk.event.subscribe()
   let completed = false
+  let errorMessage: string | undefined
 
   // Event loop
   const eventLoop = async () => {
@@ -170,7 +186,7 @@ async function runTask(
         if (part.type === "step-start") {
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "step.started",
@@ -183,7 +199,7 @@ async function runTask(
         if (part.type === "step-finish") {
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "step.completed",
@@ -196,7 +212,7 @@ async function runTask(
         if (part.type === "tool" && part.state.status === "running") {
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "tool.started",
@@ -208,24 +224,38 @@ async function runTask(
         }
 
         if (part.type === "tool" && part.state.status === "completed") {
+          const toolOutput = (part.state as { output?: Record<string, unknown> }).output
+          const toolTitle = (part.state as { title?: string }).title
+
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "tool.completed",
                 tool: part.tool,
-                output: (part.state as { output?: Record<string, unknown> }).output,
-                title: (part.state as { title?: string }).title,
+                output: toolOutput,
+                title: toolTitle,
               },
             },
           })
+
+          // Track file changes from write/edit tools
+          const writeLikeTools = ["write", "edit", "file_write", "file_edit", "patch"]
+          if (writeLikeTools.some(t => part.tool.toLowerCase().includes(t))) {
+            const filePath = (part.state as { input?: { file_path?: string; path?: string } }).input?.file_path
+              || (part.state as { input?: { file_path?: string; path?: string } }).input?.path
+            if (filePath && !filesChanged.includes(filePath)) {
+              filesChanged.push(filePath)
+            }
+          }
         }
 
         if (part.type === "text" && part.time?.end) {
+          lastCompleteText = part.text
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "text.complete",
@@ -238,7 +268,7 @@ async function runTask(
         if (part.type === "text" && !part.time?.end) {
           sendMessage({
             type: "event",
-            id: taskId || sessionId,
+            id: msgId,
             payload: {
               event: {
                 type: "text.delta",
@@ -255,7 +285,7 @@ async function runTask(
 
         sendMessage({
           type: "permission_request",
-          id: taskId || sessionId,
+          id: msgId,
           payload: {
             permissionId: permission.id,
             sessionId,
@@ -285,9 +315,10 @@ async function runTask(
           errorMsg = String(props.error.data.message)
         }
 
+        errorMessage = errorMsg
         sendMessage({
           type: "error",
-          id: taskId || sessionId,
+          id: msgId,
           payload: {
             code: "SESSION_ERROR",
             message: errorMsg,
@@ -301,7 +332,6 @@ async function runTask(
   const eventPromise = eventLoop()
 
   // Send the prompt
-  const model = agent ? undefined : undefined // Will use default
   const selectedAgent = await (async () => {
     if (!agent) return undefined
     const entry = await Agent.get(agent)
@@ -319,6 +349,22 @@ async function runTask(
   // Wait for completion
   await eventPromise
 
+  // Send result message — this is what Jan's delegate tool waits for
+  sendMessage({
+    type: "result",
+    id: msgId,
+    payload: {
+      sessionId,
+      status: completed ? "completed" : errorMessage ? "error" : "cancelled",
+      summary: lastCompleteText,
+      filesChanged: filesChanged.length > 0 ? filesChanged : undefined,
+      error: errorMessage,
+    },
+  })
+
+  // Clear active session
+  activeSession = null
+
   return sessionId
 }
 
@@ -326,13 +372,19 @@ export const StdioCommand = cmd({
   command: "stdio",
   describe: "Run opencode in stdio mode for integration with external tools",
   builder: (yargs: Argv) => {
-    return yargs.option("project", {
-      type: "string",
-      describe: "project path to work in",
-    })
+    return yargs
+      .option("project", {
+        type: "string",
+        describe: "project path to work in",
+      })
+      .option("agent", {
+        type: "string",
+        describe: "agent type to use (e.g. build, plan, explore)",
+      })
   },
   handler: async (args) => {
     const projectPath = args.project || process.cwd()
+    const defaultAgent = args.agent as string | undefined
 
     // Send ready message
     sendMessage({
@@ -344,39 +396,89 @@ export const StdioCommand = cmd({
       },
     })
 
-    // Read messages from stdin
-    const stdin = Bun.stdin()
+    // Read messages from stdin — handle line-by-line (chunks may contain partial lines)
+    const stdinStream = Bun.stdin.stream()
+    const reader = stdinStream.getReader()
     const decoder = new TextDecoder()
+    let buffer = ""
+    let running = true
 
-    for await (const chunk of stdin) {
-      const line = decoder.decode(chunk).trim()
-      if (!line) continue
+    while (running) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const chunk = value
+      buffer += decoder.decode(chunk)
+      const lines = buffer.split("\n")
+      // Keep the last (possibly incomplete) line in the buffer
+      buffer = lines.pop() || ""
 
-      try {
-        const message: JanToOpenCode = JSON.parse(line)
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
 
-        if (message.type === "task") {
-          const payload = message.payload as TaskPayload
-          await bootstrap(payload.projectPath || projectPath, async () => {
-            const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
-              const request = new Request(input, init)
-              return Server.App().fetch(request)
-            }) as typeof globalThis.fetch
-            const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
-            await runTask(sdk, payload.projectPath || projectPath, payload.prompt, payload.agent, message.id)
+        try {
+          const message: JanToOpenCode = JSON.parse(trimmed)
+
+          if (message.type === "task") {
+            const payload = message.payload as TaskPayload
+            const taskProjectPath = payload.projectPath || projectPath
+            const taskAgent = payload.agent || defaultAgent
+            await bootstrap(taskProjectPath, async () => {
+              const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+                const request = new Request(input, init)
+                return Server.App().fetch(request)
+              }) as typeof globalThis.fetch
+              const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
+              await runTask(sdk, taskProjectPath, payload.prompt, taskAgent, message.id)
+            })
+          }
+
+          if (message.type === "permission_response") {
+            const payload = message.payload as PermissionResponsePayload
+            if (activeSession) {
+              // Map Jan's action format to OpenCode's reply format
+              const replyMap: Record<string, string> = {
+                allow_once: "once",
+                allow_always: "always",
+                deny: "reject",
+              }
+              const reply = replyMap[payload.action] || "reject"
+              await activeSession.sdk.permission.reply({
+                requestID: payload.permissionId,
+                reply: reply as "once" | "always" | "reject",
+              })
+            }
+          }
+
+          if (message.type === "cancel") {
+            if (activeSession) {
+              await activeSession.sdk.session.abort({
+                sessionID: activeSession.sessionId,
+              })
+            }
+          }
+
+          if (message.type === "input") {
+            // Input messages are not yet used in OpenCode's stdio mode
+            // but we handle them gracefully
+            const payload = message.payload as InputPayload
+            if (activeSession) {
+              await activeSession.sdk.session.prompt({
+                sessionID: activeSession.sessionId,
+                parts: [{ type: "text", text: payload.text }],
+              })
+            }
+          }
+        } catch (e) {
+          sendMessage({
+            type: "error",
+            id: "unknown",
+            payload: {
+              code: "PARSE_ERROR",
+              message: e instanceof Error ? e.message : String(e),
+            },
           })
         }
-
-        // Handle other message types (permission_response, cancel, input) if needed
-      } catch (e) {
-        sendMessage({
-          type: "error",
-          id: "unknown",
-          payload: {
-            code: "PARSE_ERROR",
-            message: e instanceof Error ? e.message : String(e),
-          },
-        })
       }
     }
   },
